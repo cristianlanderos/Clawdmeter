@@ -132,6 +132,36 @@ configure_chime() {
     fi
 }
 
+# With more than one plan configured, offer the Claude Code prompt hook. It
+# tells the daemon which config dir you last prompted in, so the device shows
+# that plan right away instead of guessing from whose usage rose last.
+configure_prompt_hook() {
+    local raw py ans d
+    raw=$(current_config_value config_dirs)
+    [ -n "$raw" ] || return 0
+    local -a dirs=()
+    local IFS=','
+    for d in $raw; do
+        d=$(echo "$d" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [ -n "$d" ] && dirs+=("${d/#\~/$HOME}")
+    done
+    unset IFS
+    [ ${#dirs[@]} -ge 2 ] || return 0
+    py="${PYTHON3:-$(command -v python3)}"
+    if [ ! -t 0 ] || [ -z "$py" ]; then
+        echo "  To show the plan you last prompted in, run:"
+        echo "    $SCRIPT_DIR/daemon/clawdmeter-hook-install ${dirs[*]}"
+        return 0
+    fi
+    read -r -p "  Show the plan you last prompted in (adds a Claude Code hook)? [Y/n] " ans || ans=""
+    if [[ "$ans" =~ ^[Nn]$ ]]; then
+        echo "  Hook skipped; the daemon guesses the plan from usage."
+        return 0
+    fi
+    "$py" "$SCRIPT_DIR/daemon/clawdmeter-hook-install" "${dirs[@]}" \
+        || echo "  Warning: some settings.json files were not changed (see above)."
+}
+
 echo "=== Clawdmeter macOS install ==="
 echo ""
 
@@ -211,6 +241,7 @@ echo ""
 # clock display and session-reset chime. All re-read by the daemon each poll.
 echo "[4/6] Configuring the daemon..."
 configure_config_dirs
+configure_prompt_hook
 configure_clock
 configure_chime
 echo ""

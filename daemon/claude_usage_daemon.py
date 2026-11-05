@@ -50,6 +50,10 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 DEFAULT_CONFIG_DIR = Path.home() / ".claude"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
+# Written by daemon/clawdmeter-prompt-hook (a Claude Code UserPromptSubmit
+# hook): the config dir of the most recent prompt. Overrides the usage-rise
+# guess in PlanSelector when it names a configured dir.
+LAST_PROMPT_FILE = CONFIG_FILE.parent / "last-prompt"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -543,29 +547,102 @@ def _billing_period_info(now: float, reset_ts: str) -> dict:
     }
 
 
+def _same_dir(a: Path, b: Path) -> bool:
+    """True when two config-dir paths name the same directory (~, symlinks,
+    trailing slashes and missing dirs all tolerated)."""
+    try:
+        return a.expanduser().resolve() == b.expanduser().resolve()
+    except (OSError, RuntimeError):
+        return a.expanduser() == b.expanduser()
+
+
+def read_last_prompt_dir() -> Path | None:
+    """The config dir of the last Claude Code prompt, from LAST_PROMPT_FILE.
+
+    None when the hook is not installed (no file) or the file is empty.
+    """
+    try:
+        lines = LAST_PROMPT_FILE.read_text().strip().splitlines()
+    except OSError:
+        return None
+    if not lines or not lines[0].strip():
+        return None
+    return Path(lines[0].strip()).expanduser()
+
+
+def last_prompt_mtime() -> int | None:
+    """LAST_PROMPT_FILE's mtime in ns, or None when it does not exist."""
+    try:
+        return LAST_PROMPT_FILE.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 class PlanSelector:
     """Decide which config dir's plan is "active" across polls.
 
-    "Active" = the plan whose session % rose most recently (recent API activity).
-    A rise stamps a monotonic poll counter, so the choice is sticky and a window
-    reset (a drop to 0) isn't mistaken for use. Before any rise is seen (startup)
-    the highest current session % wins. Mirrors the Linux bash daemon.
+    1. The dir of the last Claude Code prompt wins, when the prompt hook
+       reported one (see read_last_prompt_dir) and that dir has a payload.
+    2. Otherwise, the plan whose session % rose most recently (recent API
+       activity). A rise stamps a monotonic poll counter, so the choice is
+       sticky and a window reset (a drop to 0) isn't mistaken for use.
+    3. Before any rise is seen (startup) the highest current session % wins.
+
+    Mirrors the Linux bash daemon.
     """
 
     def __init__(self) -> None:
         self.prev_s: dict[Path, int] = {}
         self.last_active: dict[Path, int] = {}
         self.seq = 0
+        self.current: Path | None = None   # the dir the last choose() returned
+        self.reason = ""                   # "last prompt" or "usage" (for logs)
 
-    def choose(self, sessions: dict[Path, int]) -> Path:
+    def choose(self, sessions: dict[Path, int], prompted: Path | None = None) -> Path:
         """Update state from this cycle's {dir: session_pct} and return the active dir."""
         self.seq += 1
         for d, s in sessions.items():
             if d in self.prev_s and s > self.prev_s[d]:
                 self.last_active[d] = self.seq
             self.prev_s[d] = s
-        # Most recent activity wins; ties (and the startup case) break by highest %.
-        return max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+        chosen = None
+        if prompted is not None:
+            chosen = next((d for d in sessions if _same_dir(d, prompted)), None)
+        if chosen is not None:
+            self.reason = "last prompt"
+        else:
+            # Most recent activity wins; ties (and the startup case) break by highest %.
+            chosen = max(sessions, key=lambda d: (self.last_active.get(d, 0), sessions[d]))
+            self.reason = "usage"
+        self.current = chosen
+        return chosen
+
+    def is_current(self, d: Path) -> bool:
+        return self.current is not None and _same_dir(self.current, d)
+
+
+class PromptWatcher:
+    """Notice when a new prompt lands in a plan other than the one shown.
+
+    The hook rewrites LAST_PROMPT_FILE on every prompt. The main loops call
+    switch_pending() each tick and poll early when it is True, so the device
+    follows a plan switch in seconds instead of waiting for POLL_INTERVAL.
+    A prompt in the plan already shown costs no API call.
+    """
+
+    def __init__(self, selector: PlanSelector) -> None:
+        self.selector = selector
+        self.seen = last_prompt_mtime()   # prompts before startup are not "new"
+
+    def switch_pending(self) -> bool:
+        mtime = last_prompt_mtime()
+        if mtime is None or mtime == self.seen:
+            return False
+        self.seen = mtime
+        if len(read_config_dirs()) < 2:
+            return False
+        d = read_last_prompt_dir()
+        return d is not None and not self.selector.is_current(d)
 
 
 # Module-level so the active-plan state survives reconnects.
@@ -609,10 +686,16 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
             sessions[d] = int(payload.get("s", 0) or 0)
     if not payloads:
         return None, not any_live
-    active = selector.choose(sessions)
+    previous = selector.current
+    active = selector.choose(sessions, read_last_prompt_dir() if len(dirs) > 1 else None)
+    payload = payloads[active]
     if len(dirs) > 1:
-        log(f"Active plan: {active} (s={sessions[active]})")
-    return payloads[active], False
+        log(f"Active plan: {active} (s={sessions[active]}, by {selector.reason})")
+        if previous is not None and not _same_dir(previous, active):
+            # A plan switch drops the shown session %, which the firmware reads
+            # as a session reset. Don't let that sound a false chime.
+            payload = {k: v for k, v in payload.items() if k != "c"}
+    return payload, False
 
 
 async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
@@ -787,12 +870,19 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     used_successfully = False
+    watcher = PromptWatcher(_SELECTOR)
+    prompt_switch = False
     try:
         while client.is_connected and not stop_event.is_set():
+            if watcher.switch_pending():
+                log("Prompt in another plan; switching")
+                prompt_switch = True
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            if (session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL
+                    or (prompt_switch and elapsed >= REFRESH_MIN_GAP)):
                 session.refresh_requested.clear()
+                prompt_switch = False
                 # Pure free-ride: read whatever access token(s) Claude Code
                 # currently holds across the configured config dirs and NEVER
                 # refresh them ourselves. Claude Code (the token's owner) does all
@@ -901,8 +991,12 @@ async def run_mqtt(env: dict, stop_event: asyncio.Event, ble: "OpportunisticBle 
     pub = mqtt_transport.Publisher(env, asyncio.get_running_loop(), _on_refresh, log)
     pub.start()
     last_poll = 0.0
+    watcher = PromptWatcher(_SELECTOR)
     try:
         while not stop_event.is_set():
+            if watcher.switch_pending():
+                log("Prompt in another plan; switching")
+                refresh.set()   # same REFRESH_MIN_GAP floor as a device refresh
             since = time.time() - last_poll
             if since >= POLL_INTERVAL or (refresh.is_set() and since >= REFRESH_MIN_GAP):
                 refresh.clear()
