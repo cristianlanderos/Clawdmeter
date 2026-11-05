@@ -62,6 +62,27 @@ def test_token_for_default_dir_falls_back_to_keychain_on_macos(tmp_path, monkeyp
         assert read_token_for(tmp_path) == "TOK_KEYCHAIN"
 
 
+def test_keychain_service_default_dir_is_bare_name(monkeypatch):
+    assert mod.keychain_service_for(mod.DEFAULT_CONFIG_DIR) == "Claude Code-credentials"
+
+
+def test_keychain_service_other_dir_is_hashed():
+    # Claude Code names a CLAUDE_CONFIG_DIR dir's entry by sha256(path)[:8].
+    import hashlib
+    d = Path("/Users/someone/.claude-work")
+    h = hashlib.sha256(b"/Users/someone/.claude-work").hexdigest()[:8]
+    assert mod.keychain_service_for(d) == f"Claude Code-credentials-{h}"
+
+
+def test_token_for_other_dir_reads_its_keychain_entry_on_macos(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    seen = []
+    with patch.object(mod, "_read_token_keychain",
+                      side_effect=lambda svc: seen.append(svc) or "TOK_WORK"):
+        assert read_token_for(tmp_path) == "TOK_WORK"
+    assert seen == [mod.keychain_service_for(tmp_path)]
+
+
 def test_token_for_file_wins_over_keychain(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "DEFAULT_CONFIG_DIR", tmp_path)
     monkeypatch.setattr(mod.sys, "platform", "darwin")

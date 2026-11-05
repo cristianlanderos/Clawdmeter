@@ -13,6 +13,7 @@ import asyncio
 import calendar
 import datetime
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -131,7 +132,19 @@ def _decode_keychain_blob(raw: str) -> str:
     return raw
 
 
-def _read_token_keychain() -> str | None:
+def keychain_service_for(config_dir: Path) -> str:
+    """The Keychain service Claude Code stores a config dir's token under.
+
+    The default dir uses the bare name. A dir selected with CLAUDE_CONFIG_DIR
+    gets "<name>-<first 8 hex of sha256(dir path)>".
+    """
+    if config_dir == DEFAULT_CONFIG_DIR:
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    return f"{KEYCHAIN_SERVICE}-{digest}"
+
+
+def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
     """Read the OAuth access token from the macOS Keychain, or None.
 
     ``security … -w`` may hex-dump the stored secret (see _decode_keychain_blob),
@@ -143,7 +156,7 @@ def _read_token_keychain() -> str | None:
                 "security",
                 "find-generic-password",
                 "-s",
-                KEYCHAIN_SERVICE,
+                service,
                 "-a",
                 getpass.getuser(),
                 "-w",
@@ -189,12 +202,9 @@ def read_config_dirs() -> list[Path]:
 def read_token_for(config_dir: Path) -> str | None:
     """Read the OAuth token for one config dir.
 
-    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: the default
-    install stores the token in Keychain with no file, so for the default dir we
-    fall back to Keychain when no file is present — preserving existing
-    single-plan macOS behavior. Additional macOS dirs are read from their files;
-    a work plan whose token lives only in the single Keychain entry can't be told
-    apart there (documented follow-up).
+    Linux: each dir keeps its own ``<dir>/.credentials.json``. macOS: Claude
+    Code stores the token in Keychain with no file, so when no file is present
+    we read that dir's Keychain entry (see keychain_service_for).
     """
     cred = config_dir / ".credentials.json"
     try:
@@ -202,8 +212,8 @@ def read_token_for(config_dir: Path) -> str | None:
             return _extract_access_token(cred.read_text())
     except OSError as e:
         log(f"Error reading credentials in {config_dir}: {e}")
-    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
-        return _read_token_keychain()
+    if sys.platform == "darwin":
+        return _read_token_keychain(keychain_service_for(config_dir))
     return None
 
 

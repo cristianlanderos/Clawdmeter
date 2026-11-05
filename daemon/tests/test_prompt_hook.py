@@ -237,7 +237,23 @@ def test_install_creates_settings_with_hook(tmp_path):
     assert len(groups) == 1
     hook = groups[0]["hooks"][0]
     assert hook["type"] == "command" and "clawdmeter-prompt-hook" in hook["command"]
-    assert str(tmp_path) in hook["command"]
+
+
+def test_install_writes_through_symlink_once(tmp_path):
+    # ~/.claude-work/settings.json -> ~/.claude/settings.json, a common setup.
+    main_dir, work_dir = tmp_path / ".claude", tmp_path / ".claude-work"
+    main_dir.mkdir(); work_dir.mkdir()
+    (main_dir / "settings.json").write_text(json.dumps({"model": "opus"}))
+    (work_dir / "settings.json").symlink_to(main_dir / "settings.json")
+    assert installer.main([str(main_dir), str(work_dir)]) == 0
+    assert (work_dir / "settings.json").is_symlink()
+    s = _settings(main_dir)
+    assert s["model"] == "opus"
+    commands = [h["command"] for g in s["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
+    assert len(commands) == 1
+    assert installer.main(["--remove", str(work_dir)]) == 0
+    assert (work_dir / "settings.json").is_symlink()
+    assert _settings(main_dir) == {"model": "opus"}
 
 
 def test_install_keeps_other_settings_and_is_idempotent(tmp_path):
@@ -275,7 +291,7 @@ def test_installed_command_runs(tmp_path):
     cfg = tmp_path / "cfg dir"          # a space in the path must survive quoting
     installer.main([str(cfg)])
     command = _settings(cfg)["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-    env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+    env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"], "CLAUDE_CONFIG_DIR": str(cfg)}
     r = subprocess.run(command, shell=True, input="{}", capture_output=True, text=True, env=env)
     assert r.returncode == 0 and r.stdout == ""
     out = tmp_path / ".config" / "claude-usage-monitor" / "last-prompt"

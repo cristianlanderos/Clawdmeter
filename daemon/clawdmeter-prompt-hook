@@ -8,8 +8,8 @@
 #
 # The config dir is, in order:
 #   1. $CLAUDE_CONFIG_DIR, when Claude Code was started with it set
-#   2. the first argument (the installer passes the dir whose settings.json
-#      registered the hook)
+#   2. the first argument, if one is given (the installer passes none, so one
+#      entry serves config dirs that share a settings.json)
 #   3. the dir that holds the session transcript (<dir>/projects/...)
 #   4. ~/.claude
 #

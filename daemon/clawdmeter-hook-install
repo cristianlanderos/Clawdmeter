@@ -9,6 +9,10 @@ daemon/clawdmeter-prompt-hook as a UserPromptSubmit hook, so the daemon knows
 which plan you last prompted in. Every other setting and hook is kept. Running
 it twice is safe: an existing Clawdmeter entry is replaced, not duplicated.
 
+A symlinked settings.json is edited at its target and stays a symlink. When
+several DIRs share one file, the file gets one entry. The hook takes the dir
+from CLAUDE_CONFIG_DIR (or ~/.claude without it), so one entry serves them all.
+
 Stdlib only, Python 3.7+, so the system python3 on macOS and Linux can run it.
 """
 from __future__ import annotations
@@ -55,10 +59,10 @@ def strip_hook(settings: dict) -> dict:
     return settings
 
 
-def add_hook(settings: dict, config_dir: Path) -> dict:
+def add_hook(settings: dict) -> dict:
     """Return settings with exactly one Clawdmeter prompt-hook entry."""
     settings = strip_hook(settings)
-    command = f"{shlex.quote(str(HOOK_SCRIPT))} {shlex.quote(str(config_dir))}"
+    command = shlex.quote(str(HOOK_SCRIPT))
     hooks = dict(settings.get("hooks") or {})
     groups = list(hooks.get(EVENT) or [])
     groups.append({"hooks": [{"type": "command", "command": command, "timeout": 5}]})
@@ -68,8 +72,13 @@ def add_hook(settings: dict, config_dir: Path) -> dict:
     return settings
 
 
-def edit(config_dir: Path, remove: bool) -> bool:
+def settings_path(config_dir: Path) -> Path:
+    """DIR/settings.json, followed through any symlink to the real file."""
     path = config_dir / "settings.json"
+    return path.resolve() if path.is_symlink() else path
+
+
+def edit(path: Path, remove: bool) -> bool:
     settings: dict = {}
     if path.exists():
         try:
@@ -82,11 +91,12 @@ def edit(config_dir: Path, remove: bool) -> bool:
             return False
     elif remove:
         return True
-    new = strip_hook(settings) if remove else add_hook(settings, config_dir)
+    new = strip_hook(settings) if remove else add_hook(settings)
     if new == settings and path.exists():
+        print(f"  {path}: already up to date")
         return True
-    config_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(config_dir), prefix=".settings.", suffix=".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".settings.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(new, f, indent=2)
@@ -109,8 +119,14 @@ def main(argv: list) -> int:
         print(__doc__.strip(), file=sys.stderr)
         return 2
     ok = True
+    done = set()
     for d in dirs:
-        ok = edit(Path(d).expanduser(), remove) and ok
+        path = settings_path(Path(d).expanduser())
+        key = os.path.realpath(str(path))
+        if key in done:
+            continue              # a symlink to a file this run already edited
+        done.add(key)
+        ok = edit(path, remove) and ok
     return 0 if ok else 1
 
 
