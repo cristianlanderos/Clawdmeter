@@ -967,6 +967,20 @@ void ui_update(const UsageData* data) {
     if (maxed_session) rainbow_session = false;
     if (maxed_weekly)  rainbow_weekly  = false;
 
+    // Out of usage (enterprise: spending at 100%): Clawd sleeps, and dreams
+    // on the splash. logo_img is the static corner icon, which only boards
+    // without the animated mascot have.
+    static bool was_asleep = false;
+    const bool asleep = maxed_session || maxed_weekly || data->session_pct >= 99.5f;
+    if (asleep != was_asleep) {
+        was_asleep = asleep;
+        splash_set_asleep(asleep);
+        if (logo_img) {
+            const lv_image_dsc_t* d = asleep ? splash_asleep_icon(L.small_icons ? 2 : 3) : nullptr;
+            lv_image_set_src(logo_img, d ? d : &logo_dsc);
+        }
+    }
+
     place_marker(marker_session, elapsed_s, bar_session_w, L.usage_top_bar_y);
     place_marker(marker_weekly,  elapsed_w, bar_weekly_w,  L.usage_bottom_bar_y);
 
