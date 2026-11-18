@@ -224,6 +224,9 @@ static long     clock_base_epoch = 0;
 static uint32_t clock_base_ms = 0;
 static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
+// Plan name from the daemon ("Max", "Team"). When set it is the title, and
+// takes the place of the clock.
+static char     title_plan[12] = "";
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
 static lv_obj_t* bar_session;
@@ -922,7 +925,15 @@ void ui_update(const UsageData* data) {
     } else if (clock_base_epoch != 0) {   // clock turned off daemon-side → revert title to "Usage"
         clock_base_epoch = 0;
         clock_last_min = -1;
-        lv_label_set_text(lbl_title, "Usage");
+        if (!data->plan[0]) lv_label_set_text(lbl_title, "Usage");
+    }
+
+    // The plan name wins the title over the clock and over "Usage".
+    if (strcmp(title_plan, data->plan) != 0) {
+        strlcpy(title_plan, data->plan, sizeof(title_plan));
+        clock_last_min = -1;   // if the name went away, the clock redraws next tick
+        lv_label_set_text(lbl_title,
+                          title_plan[0] ? title_plan : clock_base_epoch > 0 ? "" : "Usage");
     }
 
     int s_pct = (int)(data->session_pct + 0.5f);
@@ -1101,7 +1112,7 @@ void ui_tick_anim(void) {
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
-    if (clock_base_epoch > 0) {
+    if (clock_base_epoch > 0 && !title_plan[0]) {
         time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is

@@ -144,11 +144,12 @@ def keychain_service_for(config_dir: Path) -> str:
     return f"{KEYCHAIN_SERVICE}-{digest}"
 
 
-def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
-    """Read the OAuth access token from the macOS Keychain, or None.
+def _read_keychain_blob(service: str = KEYCHAIN_SERVICE, quiet: bool = False) -> str | None:
+    """Read one Keychain entry's credentials blob (decoded text), or None.
 
     ``security … -w`` may hex-dump the stored secret (see _decode_keychain_blob),
-    so decode before extracting the access token.
+    so decode it here. ``quiet`` drops the failure logs, for callers whose
+    result is optional.
     """
     try:
         out = subprocess.run(
@@ -167,12 +168,44 @@ def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
             timeout=10,
         )
     except subprocess.CalledProcessError as e:
-        log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
+        if not quiet:
+            log(f"Keychain read failed (rc={e.returncode}): {e.stderr.strip()}")
         return None
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f"Keychain access error: {e}")
+        if not quiet:
+            log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(_decode_keychain_blob(out.stdout))
+    return _decode_keychain_blob(out.stdout)
+
+
+def _read_token_keychain(service: str = KEYCHAIN_SERVICE) -> str | None:
+    """Read the OAuth access token from the macOS Keychain, or None."""
+    blob = _read_keychain_blob(service)
+    return _extract_access_token(blob) if blob else None
+
+
+# Plan names shown as the device's title. Claude Code records the plan as
+# `subscriptionType` next to the token; unknown values are shown title-cased.
+PLAN_NAMES = {"max": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}
+PLAN_NAME_MAX = 11   # the firmware's UsageData.plan holds 11 characters
+
+
+def _extract_plan_name(blob: str) -> str:
+    """The display name of the plan in a credentials blob, or "" if absent."""
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for v in [data, *data.values()]:
+        if isinstance(v, dict):
+            sub = v.get("subscriptionType")
+            if isinstance(sub, str) and sub.strip():
+                sub = sub.strip()
+                name = PLAN_NAMES.get(sub.lower(), sub.replace("_", " ").title())
+                return name[:PLAN_NAME_MAX]
+    return ""
 
 
 def read_config_dirs() -> list[Path]:
@@ -215,6 +248,25 @@ def read_token_for(config_dir: Path) -> str | None:
     if sys.platform == "darwin":
         return _read_token_keychain(keychain_service_for(config_dir))
     return None
+
+
+def read_plan_for(config_dir: Path) -> str:
+    """The plan name ("Max", "Team", …) of one config dir, or "" if unknown.
+
+    Read from the same place as the token (see read_token_for). Never raises
+    and never logs: the name is optional, the device falls back to its clock
+    or "Usage" title without it.
+    """
+    cred = config_dir / ".credentials.json"
+    try:
+        if cred.exists():
+            return _extract_plan_name(cred.read_text())
+    except OSError:
+        return ""
+    if sys.platform == "darwin":
+        blob = _read_keychain_blob(keychain_service_for(config_dir), quiet=True)
+        return _extract_plan_name(blob) if blob else ""
+    return ""
 
 
 def load_cached_address() -> str | None:
@@ -709,6 +761,9 @@ async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, 
     previous = selector.current
     active = selector.choose(sessions, read_last_prompt_dir() if len(dirs) > 1 else None)
     payload = payloads[active]
+    plan = read_plan_for(active)
+    if plan:
+        payload = {**payload, "pl": plan}   # the device shows it as the title
     if len(dirs) > 1:
         log(f"Active plan: {active} (s={sessions[active]}, by {selector.reason})")
         if previous is not None and not _same_dir(previous, active):

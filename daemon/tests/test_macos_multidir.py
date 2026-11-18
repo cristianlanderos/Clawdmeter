@@ -269,3 +269,48 @@ def test_poll_api_429_without_usage_headers_is_transient():
 def test_poll_api_500_with_usage_headers_is_still_transient():
     assert _poll_with(500, {"anthropic-ratelimit-unified-5h-utilization": "0.5"}) is None
 
+
+# ---------------------------------------------------------------------------
+# plan name ("pl") — the device shows it as the title
+# ---------------------------------------------------------------------------
+
+def test_extract_plan_name_from_nested_blob():
+    blob = '{"claudeAiOauth": {"accessToken": "T", "subscriptionType": "team"}}'
+    assert mod._extract_plan_name(blob) == "Team"
+
+
+def test_extract_plan_name_unknown_and_missing():
+    assert mod._extract_plan_name('{"claudeAiOauth": {"subscriptionType": "max_ultra_plus"}}') == "Max Ultra P"
+    assert mod._extract_plan_name('{"claudeAiOauth": {"accessToken": "T"}}') == ""
+    assert mod._extract_plan_name("sk-ant-raw-token") == ""
+
+
+def test_read_plan_for_reads_credentials_file(tmp_path):
+    (tmp_path / ".credentials.json").write_text(
+        '{"claudeAiOauth": {"accessToken": "T", "subscriptionType": "max"}}')
+    assert mod.read_plan_for(tmp_path) == "Max"
+
+
+def test_poll_active_adds_plan_of_the_active_dir(monkeypatch):
+    A, B = Path("/a"), Path("/b")
+    monkeypatch.setattr(mod, "read_config_dirs", lambda: [A, B])
+    monkeypatch.setattr(mod, "read_token_for", lambda d: {A: "tA", B: "tB"}[d])
+    monkeypatch.setattr(mod, "read_plan_for", lambda d: {A: "Max", B: "Team"}[d])
+    monkeypatch.setattr(mod, "read_last_prompt_dir", lambda: B)
+
+    async def fake_poll(token):
+        return {"s": 10, "ok": True}
+    monkeypatch.setattr(mod, "poll_api", fake_poll)
+    assert _run(mod.poll_active_payload(PlanSelector()))["pl"] == "Team"
+
+
+def test_poll_active_omits_plan_when_unknown(monkeypatch):
+    A = Path("/a")
+    monkeypatch.setattr(mod, "read_config_dirs", lambda: [A])
+    monkeypatch.setattr(mod, "read_token_for", lambda d: "tA")
+    monkeypatch.setattr(mod, "read_plan_for", lambda d: "")
+
+    async def fake_poll(token):
+        return {"s": 10, "ok": True}
+    monkeypatch.setattr(mod, "poll_api", fake_poll)
+    assert "pl" not in _run(mod.poll_active_payload(PlanSelector()))
