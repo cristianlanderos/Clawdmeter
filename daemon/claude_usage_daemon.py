@@ -464,7 +464,17 @@ async def poll_api(token: str) -> dict | None:
     if resp.status_code in (401, 403):
         log(f"API HTTP {resp.status_code} (token expired/invalid)")
         raise TokenExpired()
-    if resp.status_code >= 400:
+    # A plan at its limit answers 429, but the 429 still carries the usage
+    # headers. Read them, or a full plan has no payload and the device shows
+    # another plan (or stale numbers) until the window resets.
+    has_usage = any(
+        resp.headers.get(h)
+        for h in (
+            "anthropic-ratelimit-unified-5h-utilization",
+            "anthropic-ratelimit-unified-overage-utilization",
+        )
+    )
+    if resp.status_code >= 400 and not (resp.status_code == 429 and has_usage):
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
@@ -483,7 +493,7 @@ async def poll_api(token: str) -> dict | None:
 
     def pct(util: str) -> int:
         try:
-            return int(round(float(util) * 100))
+            return min(100, int(round(float(util) * 100)))   # 429s report > 1.0
         except ValueError:
             return 0
 
